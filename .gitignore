@@ -1,5 +1,7 @@
-# build outputs
-dist/
-*.exe
+# build outputs (the released exe is checked in)
+dist/*
+!bird-startup/dist/
+bird-startup/dist/*
+!bird-startup/dist/BirdStartup.exe
 # secrets
 *.key

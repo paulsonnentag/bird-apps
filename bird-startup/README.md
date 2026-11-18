@@ -6,7 +6,7 @@ that bird's song (from [xeno-canto](https://xeno-canto.org)) as a startup sound.
 
 ## Install
 
-Double-click `BirdStartup.exe`. On first run it:
+Download [`dist/BirdStartup.exe`](dist/BirdStartup.exe) and double-click `BirdStartup.exe`. On first run it:
 
 1. Copies itself to `%LOCALAPPDATA%\BirdStartup\`. No admin rights are needed.
 2. Registers itself to run at sign-in (`HKCU\...\Run`) and adds an entry under
@@ -31,6 +31,14 @@ comes from `$XC_API_KEY` or `xenocanto.key` in this folder (gitignored).
 ./build.sh   # -> dist/BirdStartup.exe
 ```
 
-On a non-Windows machine you can test the download and wallpaper logic with
-`go run -ldflags "-X main.xenoCantoKey=$(cat xenocanto.key)" . --no-install`.
+The key is XOR-masked with a random pad per build, so it isn't a plain string in
+the exe. That stops casual `strings` scraping but not anyone determined to get it.
+
+To test the download and wallpaper logic on a non-Windows machine, pass the key
+with an all-zero pad, which leaves it unchanged:
+
+```bash
+go run -ldflags "-X main.xcKeyData=$(tr -d '\n' < xenocanto.key | xxd -p -c0) -X main.xcKeyPad=$(head -c64 /dev/zero | xxd -p -c0)" . --no-install
+```
+
 On that path, setting the wallpaper and playing the sound are only printed.

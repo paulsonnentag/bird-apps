@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,8 +23,27 @@ import (
 	"time"
 )
 
-// xenoCantoKey is injected at build time: -ldflags "-X main.xenoCantoKey=..."
-var xenoCantoKey = ""
+// The xeno-canto API key is injected at build time (see build.sh), lightly
+// obfuscated as hex(key XOR pad) plus a random hex pad, so it doesn't appear
+// as a plain string in the exe. This only deters casual inspection.
+var (
+	xcKeyData = ""
+	xcKeyPad  = ""
+)
+
+var xenoCantoKey = decodeKey(xcKeyData, xcKeyPad)
+
+func decodeKey(data, pad string) string {
+	d, err1 := hex.DecodeString(data)
+	p, err2 := hex.DecodeString(pad)
+	if err1 != nil || err2 != nil || len(p) < len(d) {
+		return ""
+	}
+	for i := range d {
+		d[i] ^= p[i]
+	}
+	return string(d)
+}
 
 const (
 	appName      = "BirdStartup"

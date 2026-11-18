@@ -48,10 +48,29 @@ func decodeKey(data, pad string) string {
 const (
 	appName      = "BirdStartup"
 	userAgent    = "BirdStartup/1.0 (desktop wallpaper app)"
-	librarySize  = 60               // birds downloaded at install
 	maxSoundTime = 20 * time.Second // startup sound length
-	maxSongBytes = 1500 << 10       // only the first ~20-40s of each recording is kept
+	maxSongBytes = 1 << 20          // first 1MB of each recording: >=20s even at 320kbps
 )
+
+// regions the library is drawn from, in order; species already picked for an
+// earlier region are skipped later. filter is extra iNaturalist query params.
+var regions = []struct {
+	name   string
+	filter map[string]string
+	count  int
+}{
+	{"Atlantic Puffin (always included)", map[string]string{"taxon_id": "4504"}, 1},
+	{"Europe", map[string]string{"place_id": "97391"}, 80},
+	{"World", nil, 70},
+}
+
+func librarySize() int {
+	n := 0
+	for _, r := range regions {
+		n += r.count
+	}
+	return n
+}
 
 type Bird struct {
 	Common      string `json:"common"`
@@ -69,7 +88,7 @@ func libraryDir() string { return filepath.Join(installDir(), "birds") }
 func main() {
 	uninstallFlag := flag.Bool("uninstall", false, "remove from startup and delete installed files")
 	noInstall := flag.Bool("no-install", false, "don't register for startup (still downloads the library if missing)")
-	refresh := flag.Bool("refresh", false, "re-download the bird library")
+	startup := flag.Bool("startup", false, "sign-in mode: just show a bird from the local library")
 	flag.Parse()
 
 	_ = os.MkdirAll(installDir(), 0o755)
@@ -87,23 +106,36 @@ func main() {
 		return
 	}
 
-	freshInstall := false
+	// Sign-in run: fully offline, just show a bird.
+	if *startup {
+		if len(localBirds()) == 0 { // library missing: try to recover quietly
+			n, err := buildLibrary(libraryDir())
+			log.Printf("library: %d birds downloaded (err=%v)", n, err)
+		}
+		if _, err := showRandomBird(); err != nil {
+			log.Printf("showRandomBird: %v", err)
+		}
+		return
+	}
+
+	// Any other run (double-clicking the exe, new version or not) installs or
+	// updates: replaces the installed exe, rewrites the registry entries and
+	// downloads a fresh bird library.
+	firstInstall := false
 	if !*noInstall {
 		var err error
-		if freshInstall, err = install(); err != nil {
+		if firstInstall, err = install(); err != nil {
 			log.Printf("install: %v", err)
 		}
 	}
 
-	if freshInstall || *refresh || len(localBirds()) == 0 {
-		go messageBox("Bird Startup", fmt.Sprintf("Downloading %d birds (photos and songs). This takes a minute or two; "+
-			"you'll hear the first one when it's done.", librarySize))
-		n, err := buildLibrary(libraryDir(), librarySize)
-		log.Printf("library: %d birds downloaded (err=%v)", n, err)
-		if n == 0 && len(localBirds()) == 0 {
-			messageBox("Bird Startup", "Couldn't download any birds. Check your internet connection and run BirdStartup again.\n\n"+fmt.Sprint(err))
-			return
-		}
+	go messageBox("Bird Startup", fmt.Sprintf("Downloading %d birds (photos and songs). This takes a minute or two; "+
+		"you'll hear the first one when it's done.", librarySize()))
+	n, err := buildLibrary(libraryDir())
+	log.Printf("library: %d birds downloaded (err=%v)", n, err)
+	if n == 0 && len(localBirds()) == 0 {
+		messageBox("Bird Startup", "Couldn't download any birds. Check your internet connection and run BirdStartup again.\n\n"+fmt.Sprint(err))
+		return
 	}
 
 	bird, err := showRandomBird()
@@ -111,14 +143,20 @@ func main() {
 		log.Printf("showRandomBird: %v", err)
 	}
 
-	if freshInstall {
-		msg := fmt.Sprintf("Bird Startup is installed with %d birds! A random one will greet you every time you sign in.\n\n"+
-			"To remove it, use Settings > Apps > Installed apps > Bird Startup.", len(localBirds()))
-		if bird != nil {
-			msg = "Today's bird: " + bird.Common + " (" + bird.Scientific + ")\n\n" + msg
-		}
-		messageBox("Bird Startup", msg)
+	var msg string
+	switch {
+	case n == 0:
+		msg = "Couldn't download new birds (offline?), keeping your existing library.\n\n"
+	case firstInstall:
+		msg = fmt.Sprintf("Bird Startup is installed with %d birds! A random one will greet you every time you sign in.\n\n", n)
+	default:
+		msg = fmt.Sprintf("Bird Startup is up to date, with %d fresh birds.\n\n", n)
 	}
+	msg += "Run BirdStartup.exe again any time to update. To remove it, use Settings > Apps > Installed apps > Bird Startup."
+	if bird != nil {
+		msg = "Today's bird: " + bird.Common + " (" + bird.Scientific + ")\n\n" + msg
+	}
+	messageBox("Bird Startup", msg)
 }
 
 // ---- startup: everything local ----
@@ -173,11 +211,12 @@ func showRandomBird() (*Bird, error) {
 // ---- install: build the library ----
 
 type candidate struct {
+	region                                        int
 	genus, species, common, photoURL, attribution string
 }
 
-// buildLibrary downloads up to n distinct bird species (photo + song) into dir.
-func buildLibrary(dir string, n int) (int, error) {
+// buildLibrary downloads distinct bird species (photo + song) for each region into dir.
+func buildLibrary(dir string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	tmp := dir + ".new"
@@ -188,20 +227,20 @@ func buildLibrary(dir string, n int) (int, error) {
 
 	var (
 		mu      sync.Mutex
-		done    int
+		done    = make([]int, len(regions))
 		lastErr error
 		seen    = map[string]bool{}
 		jobs    = make(chan candidate)
 		wg      sync.WaitGroup
 	)
-	enough := func() bool { mu.Lock(); defer mu.Unlock(); return done >= n }
+	enough := func(r int) bool { mu.Lock(); defer mu.Unlock(); return done[r] >= regions[r].count }
 
-	for w := 0; w < 4; w++ {
+	for w := 0; w < 6; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for c := range jobs {
-				if enough() {
+				if enough(c.region) {
 					continue
 				}
 				if err := fetchBird(ctx, tmp, c); err != nil {
@@ -211,50 +250,69 @@ func buildLibrary(dir string, n int) (int, error) {
 					continue
 				}
 				mu.Lock()
-				done++
+				done[c.region]++
 				mu.Unlock()
 			}
 		}()
 	}
 
-	// Walk random pages of the ~10,000 most-faved research-grade bird photos.
-	pages := rand.Perm(50)
-	for _, page := range pages {
-		if enough() || ctx.Err() != nil {
-			break
-		}
-		cands, err := inatPage(ctx, page+1)
-		if err != nil {
-			mu.Lock()
-			lastErr = err
-			mu.Unlock()
-			continue
-		}
-		for _, c := range cands {
-			key := c.genus + " " + c.species
-			if seen[key] || enough() {
+	// Per region, walk random pages of the ~10,000 most-faved research-grade
+	// bird observations there.
+	for r, reg := range regions {
+		for _, page := range rand.Perm(50) {
+			if enough(r) || ctx.Err() != nil {
+				break
+			}
+			cands, err := inatPage(ctx, page+1, reg.filter)
+			if err != nil {
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
 				continue
 			}
-			seen[key] = true
-			jobs <- c
+			for _, c := range cands {
+				key := c.genus + " " + c.species
+				if seen[key] || enough(r) {
+					continue
+				}
+				seen[key] = true
+				c.region = r
+				jobs <- c
+			}
 		}
 	}
 	close(jobs)
 	wg.Wait()
 
-	if done == 0 {
+	total := 0
+	for r, n := range done {
+		log.Printf("library: %s: %d birds", regions[r].name, n)
+		total += n
+	}
+	if total == 0 {
 		os.RemoveAll(tmp)
 		if lastErr == nil {
 			lastErr = errors.New("no birds found")
 		}
 		return 0, lastErr
 	}
-	// Swap the new library in.
-	os.RemoveAll(dir)
-	if err := os.Rename(tmp, dir); err != nil {
+	// Swap the new library in. Rename (not delete) the old one first: that
+	// works even if a sign-in run is still playing a song from it.
+	old := fmt.Sprintf("%s.old-%d", dir, time.Now().UnixNano())
+	if err := os.Rename(dir, old); err != nil && !os.IsNotExist(err) {
 		return 0, err
 	}
-	return done, nil
+	if err := os.Rename(tmp, dir); err != nil {
+		os.Rename(old, dir)
+		return 0, err
+	}
+	// Best-effort cleanup of this and any earlier leftovers.
+	if leftovers, _ := filepath.Glob(dir + ".old-*"); leftovers != nil {
+		for _, l := range leftovers {
+			os.RemoveAll(l)
+		}
+	}
+	return total, nil
 }
 
 func fetchBird(ctx context.Context, lib string, c candidate) error {
@@ -310,7 +368,7 @@ type inatResponse struct {
 	} `json:"results"`
 }
 
-func inatPage(ctx context.Context, page int) ([]candidate, error) {
+func inatPage(ctx context.Context, page int, filter map[string]string) ([]candidate, error) {
 	q := url.Values{
 		"taxon_id":      {"3"}, // Aves
 		"photos":        {"true"},
@@ -321,6 +379,9 @@ func inatPage(ctx context.Context, page int) ([]candidate, error) {
 		// v2 lets us request only the fields we need (full v1 pages are 20MB+).
 		"fields": {"(taxon:(name:!t,rank:!t,preferred_common_name:!t)," +
 			"photos:(url:!t,attribution:!t,original_dimensions:(width:!t,height:!t)))"},
+	}
+	for k, v := range filter {
+		q.Set(k, v)
 	}
 	var resp inatResponse
 	if err := getJSON(ctx, "https://api.inaturalist.org/v2/observations?"+q.Encode(), &resp); err != nil {

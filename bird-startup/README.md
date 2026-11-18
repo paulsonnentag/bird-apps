@@ -11,14 +11,19 @@ Download [`dist/BirdStartup.exe`](dist/BirdStartup.exe) and double-click `BirdSt
 1. Copies itself to `%LOCALAPPDATA%\BirdStartup\`. No admin rights are needed.
 2. Registers itself to run at sign-in (`HKCU\...\Run`) and adds an entry under
    **Settings → Apps → Installed apps**.
-3. Downloads a library of about 60 bird species (a photo plus the first 20–40 s of
-   a song recording, roughly 130 MB in total) into `%LOCALAPPDATA%\BirdStartup\birds\`.
+3. Downloads a library of about 150 bird species, 80 European and 70 from around
+   the world (a photo plus the start of a song recording for each, roughly 300 MB) into `%LOCALAPPDATA%\BirdStartup\birds\`.
 
 After that, startup works fully offline: it picks a random bird from the local
 library, crops the photo to your screen, adds the name and credits, sets it as the
 wallpaper, and plays up to 20 s of the song with a fade-out.
 
-Flags: `--refresh` re-downloads a new set of birds. `--uninstall` removes the app,
+**Updating:** run `BirdStartup.exe` again (a new download or the installed copy).
+Every manual run replaces the installed exe and downloads a fresh set of birds.
+The sign-in entry runs it with `--startup`, which only uses the local library.
+The library always includes an Atlantic Puffin.
+
+Flags: `--uninstall` removes the app,
 or you can uninstall it from Settings → Apps. Each run writes a log to
 `%LOCALAPPDATA%\BirdStartup\log.txt`.
 

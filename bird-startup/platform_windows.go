@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,12 +19,16 @@ import (
 )
 
 var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	winmm                = windows.NewLazySystemDLL("winmm.dll")
-	procSystemParamsInfo = user32.NewProc("SystemParametersInfoW")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
-	procMessageBox       = user32.NewProc("MessageBoxW")
-	procMciSendString    = winmm.NewProc("mciSendStringW")
+	user32                = windows.NewLazySystemDLL("user32.dll")
+	winmm                 = windows.NewLazySystemDLL("winmm.dll")
+	procSystemParamsInfo  = user32.NewProc("SystemParametersInfoW")
+	procGetSystemMetrics  = user32.NewProc("GetSystemMetrics")
+	procMessageBox        = user32.NewProc("MessageBoxW")
+	procMciSendString     = winmm.NewProc("mciSendStringW")
+	procMciGetErrorString = winmm.NewProc("mciGetErrorStringW")
+	procPeekMessage       = user32.NewProc("PeekMessageW")
+	procTranslateMessage  = user32.NewProc("TranslateMessage")
+	procDispatchMessage   = user32.NewProc("DispatchMessageW")
 )
 
 const (
@@ -40,30 +46,31 @@ func installDir() string {
 
 func installedExe() string { return filepath.Join(installDir(), appName+".exe") }
 
-// install copies this exe into %LOCALAPPDATA% and registers it to run at
-// sign-in (per-user, no admin needed). Returns true if this run is the one
-// that installed it (i.e. it was launched from somewhere else).
+// install copies this exe into %LOCALAPPDATA% (replacing any older copy) and
+// registers it to run at sign-in (per-user, no admin needed). Returns true if
+// it wasn't installed before.
 func install() (bool, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return false, err
 	}
 	target := installedExe()
-	if strings.EqualFold(filepath.Clean(self), filepath.Clean(target)) {
-		return false, nil // already running the installed copy
-	}
+	_, statErr := os.Stat(target)
+	first := os.IsNotExist(statErr)
 	if err := os.MkdirAll(installDir(), 0o755); err != nil {
-		return false, err
+		return first, err
 	}
-	if err := copyFile(self, target); err != nil {
-		return false, err
+	if !strings.EqualFold(filepath.Clean(self), filepath.Clean(target)) {
+		if err := replaceFile(self, target); err != nil {
+			return first, err
+		}
 	}
 
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
 	if err != nil {
-		return false, err
+		return first, err
 	}
-	k.SetStringValue(appName, `"`+target+`"`)
+	k.SetStringValue(appName, `"`+target+`" --startup`)
 	k.Close()
 
 	// Show up in Settings > Apps so it's easy to remove.
@@ -77,7 +84,7 @@ func install() (bool, error) {
 		u.SetDWordValue("NoRepair", 1)
 		u.Close()
 	}
-	return true, nil
+	return first, nil
 }
 
 func uninstall() error {
@@ -93,7 +100,9 @@ func uninstall() error {
 	return cmd.Start()
 }
 
-func copyFile(src, dst string) error {
+// replaceFile copies src over dst. Windows won't delete or overwrite a
+// running exe, but it will rename one, so the old copy is moved aside first.
+func replaceFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -109,8 +118,17 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	out.Close()
-	os.Remove(dst)
-	return os.Rename(tmp, dst)
+	old := dst + ".old"
+	os.Remove(old) // leftover from a previous update, if no longer running
+	if err := os.Rename(dst, old); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Rename(old, dst)
+		return err
+	}
+	os.Remove(old) // fails harmlessly if the old copy is still running
+	return nil
 }
 
 func screenSize() (int, int) {
@@ -146,14 +164,39 @@ func mci(cmd string) (string, error) {
 	buf := make([]uint16, 256)
 	r, _, _ := procMciSendString.Call(uintptr(unsafe.Pointer(c)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
 	if r != 0 {
-		return "", fmt.Errorf("mci %q failed: code %d", cmd, r)
+		msg := make([]uint16, 256)
+		procMciGetErrorString.Call(r, uintptr(unsafe.Pointer(&msg[0])), uintptr(len(msg)))
+		err := fmt.Errorf("mci %q: %s (code %d)", cmd, windows.UTF16ToString(msg), r)
+		log.Print(err)
+		return "", err
 	}
 	return windows.UTF16ToString(buf), nil
+}
+
+// pumpMessages dispatches pending window messages for this thread. The MCI
+// mpegvideo (DirectShow) device creates a hidden window on the opening thread
+// and needs its messages processed to keep playing.
+func pumpMessages() {
+	var msg [48]byte // MSG struct, large enough on amd64/arm64
+	const pmRemove = 1
+	for {
+		r, _, _ := procPeekMessage.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0, pmRemove)
+		if r == 0 {
+			return
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg[0])))
+		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg[0])))
+	}
 }
 
 // playSound plays the mp3 via the built-in Windows MCI player (no codecs or
 // extra DLLs needed), up to max length, fading out over the last 2 seconds.
 func playSound(path string, maxLen time.Duration) error {
+	// MCI devices belong to the OS thread that opened them; without this the Go
+	// scheduler can move us to another thread and every later call fails.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if _, err := mci(`open "` + path + `" type mpegvideo alias bird`); err != nil {
 		return err
 	}
@@ -161,6 +204,7 @@ func playSound(path string, maxLen time.Duration) error {
 	mci("set bird time format milliseconds")
 	dur := int(maxLen.Milliseconds())
 	if s, err := mci("status bird length"); err == nil {
+		log.Printf("sound length: %s ms", s)
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n < dur {
 			dur = n
 		}
@@ -170,10 +214,14 @@ func playSound(path string, maxLen time.Duration) error {
 	if _, err := mci(fmt.Sprintf("play bird from 0 to %d", dur)); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(time.Duration(dur+5000) * time.Millisecond)
+	log.Printf("playing %d ms", dur)
+	start := time.Now()
+	deadline := start.Add(time.Duration(dur+5000) * time.Millisecond)
 	for time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-		if mode, _ := mci("status bird mode"); mode != "playing" {
+		pumpMessages()
+		time.Sleep(50 * time.Millisecond)
+		mode, err := mci("status bird mode")
+		if err == nil && mode == "stopped" && time.Since(start) > 500*time.Millisecond {
 			break
 		}
 		if s, err := mci("status bird position"); err == nil {
@@ -183,6 +231,7 @@ func playSound(path string, maxLen time.Duration) error {
 			}
 		}
 	}
+	log.Printf("sound finished after %s", time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
